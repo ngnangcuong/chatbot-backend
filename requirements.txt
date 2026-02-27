@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+langchain
+langchain-community
+langchain-chroma
+PyPDF2
+pandas
+python-multipart
+sqlalchemy
+chromadb
+pytest
