@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 # Constants
 VECTOR_DB_PATH = "./chroma_db"
 OLLAMA_MODEL = "phi3"
+EMBEDDING_MODEL = "nomic-embed-text"
+COLLECTION_NAME = "chatbot_embeddings"
 
 def extract_text_from_file(file_path: str, filename: str) -> str:
     """Extract text from PDF, CSV or TXT file."""
@@ -44,20 +46,21 @@ def extract_text_from_file(file_path: str, filename: str) -> str:
         raise
     return text
 
-def process_and_store_document(session_id: str, file: UploadFile):
-    """Processes an uploaded document, chunks it, and stores in Chroma."""
+def process_and_store_document_background(session_id: str, filename: str, file_content: bytes):
+    """Processes an uploaded document, chunks it, and stores in Chroma in the background."""
     
     # Save file temporarily to disk since we might need seek operations
     temp_dir = tempfile.mkdtemp()
-    temp_path = os.path.join(temp_dir, file.filename)
+    temp_path = os.path.join(temp_dir, filename)
     
     try:
         with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            buffer.write(file_content)
             
-        text = extract_text_from_file(temp_path, file.filename)
+        text = extract_text_from_file(temp_path, filename)
         if not text.strip():
-            raise ValueError("No text could be extracted from the document.")
+            logger.warning("No text could be extracted from the document.")
+            return
             
         # Split text into manageable chunks
         text_splitter = RecursiveCharacterTextSplitter(
@@ -68,29 +71,36 @@ def process_and_store_document(session_id: str, file: UploadFile):
         chunks = text_splitter.split_text(text)
         
         # Prepare metadata to associate chunks with a specific session
-        metadatas = [{"session_id": session_id, "filename": file.filename} for _ in chunks]
+        metadatas = [{"session_id": session_id, "filename": filename} for _ in chunks]
         
         # Setup vector store
-        embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
+        embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
         vector_store = Chroma(
-            collection_name="chatbot_documents",
+            collection_name=COLLECTION_NAME,
             embedding_function=embeddings,
             persist_directory=VECTOR_DB_PATH
         )
         
         # Add chunks to vector store
         vector_store.add_texts(texts=chunks, metadatas=metadatas)
-        logger.info(f"Successfully processed {len(chunks)} chunks from {file.filename}")
+        logger.info(f"Successfully processed {len(chunks)} chunks from {filename}")
         
+    except Exception as e:
+        logger.error(f"Background processing error for {filename}: {e}")
+        raise
     finally:
         # Clean up temporary directory
         shutil.rmtree(temp_dir)
 
+def process_and_store_document(session_id: str, file: UploadFile):
+    """(Deprecated) synchronous process."""
+    pass
+
 def get_session_retriever(session_id: str):
     """Gets a retriever scoped to a specific session ID."""
-    embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vector_store = Chroma(
-        collection_name="chatbot_documents",
+        collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
         persist_directory=VECTOR_DB_PATH
     )
@@ -102,6 +112,10 @@ def get_session_retriever(session_id: str):
 
 def generate_chat_response(session_id: str, query: str, chat_history: list):
     """Generates an AI response incorporating history and document context."""
+    return ""
+
+async def generate_chat_response_stream(session_id: str, query: str, chat_history: list):
+    """Generates an AI response stream incorporating history and document context."""
     llm = Ollama(model=OLLAMA_MODEL)
     retriever = get_session_retriever(session_id)
     
@@ -139,9 +153,14 @@ def generate_chat_response(session_id: str, query: str, chat_history: list):
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
     
-    response = rag_chain.invoke({
-        "input": query,
-        "chat_history": formatted_history
-    })
-    
-    return response["answer"]
+    logger.info("Starting RAG chain stream...")
+    try:
+        async for chunk in rag_chain.astream({
+            "input": query,
+            "chat_history": formatted_history
+        }):
+            if "answer" in chunk:
+                yield chunk["answer"]
+    except Exception as e:
+        logger.error(f"Error during rag_chain.astream: {e}")
+        yield f"\n[Error: {e}]"

@@ -3,12 +3,13 @@ import uuid
 from typing import List
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 
 import models
 from database import engine, get_db
-from llm_service import process_and_store_document, generate_chat_response
+from llm_service import process_and_store_document_background, generate_chat_response_stream
 
 # Configure logging
 logging.basicConfig(
@@ -51,7 +52,7 @@ def create_session(db: Session = Depends(get_db)):
     return {"session_id": session_id}
 
 @app.post("/api/upload")
-def upload_document(
+async def upload_document(
     session_id: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
@@ -72,8 +73,11 @@ def upload_document(
         db.add(db_file)
         db.commit()
         
-        # Process and store in ChromaDB
-        process_and_store_document(session_id, file)
+        # Read file contents before resolving the endpoint
+        file_content = await file.read()
+        
+        # Process and store in ChromaDB synchronously
+        process_and_store_document_background(session_id, file.filename, file_content)
         
         return {"status": "success", "filename": file.filename}
     except Exception as e:
@@ -103,39 +107,50 @@ class ChatRequest(BaseModel):
     message: str
 
 @app.post("/api/chat")
-def chat(request: ChatRequest, db: Session = Depends(get_db)):
-    """Handles chat messages and AI response."""
+async def chat(request: ChatRequest, db: Session = Depends(get_db)):
+    """Handles chat messages and AI response via stream."""
     # Verify session
     db_session = db.query(models.Session).filter(models.Session.id == request.session_id).first()
     if not db_session:
         raise HTTPException(status_code=404, detail="Session not found")
         
-    # Generate response
     try:
         # Retrieve history for context
         history = db.query(models.Message).filter(
             models.Message.session_id == request.session_id
         ).order_by(models.Message.created_at.asc()).all()
         
-        # Generate response using LLM service
-        ai_response_content = generate_chat_response(
-            session_id=request.session_id,
-            query=request.message,
-            chat_history=history
-        )
-        
-        # Save user message
+        # Save user message immediately, before streaming
         user_msg = models.Message(session_id=request.session_id, role="user", content=request.message)
         db.add(user_msg)
-        
-        # Save AI message
-        ai_msg = models.Message(session_id=request.session_id, role="ai", content=ai_response_content)
-        db.add(ai_msg)
-        
         db.commit()
-        
-        return {"response": ai_response_content}
-        
+
+        async def generate():
+            full_response = ""
+            # Generate response using LLM service streaming
+            async for chunk in generate_chat_response_stream(
+                session_id=request.session_id,
+                query=request.message,
+                chat_history=history
+            ):
+                full_response += chunk
+                yield chunk
+                
+            # Save AI message after stream completes
+            if full_response.strip():
+                try:
+                    # Need fresh DB session as the outer one might be closed or tied to request lifecycle
+                    # but Depends(get_db) stays open until response finishes! 
+                    ai_msg = models.Message(session_id=request.session_id, role="ai", content=full_response)
+                    db.add(ai_msg)
+                    db.commit()
+                except Exception as inner_e:
+                    logger.error(f"Failed to save AI message: {inner_e}")
+            else:
+                logger.warning("Stream yielded no content, skipping saving AI message")
+
+        return StreamingResponse(generate(), media_type="text/plain")
+
     except Exception as e:
         logger.error(f"Error during chat handling: {e}")
         db.rollback()
